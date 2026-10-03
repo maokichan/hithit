@@ -1,0 +1,33 @@
+{
+  "seed": 42,
+  "workload": {
+    "n_sessions": 30,
+    "sim_time": 86400.0,
+    "request_rate": 0.0011111,
+    "rate_heterogeneity_cv": 0.5,
+    "stable_prefix_tokens": 1000.0,
+    "n_stable_blocks": 4,
+    "input_tokens_mean": 150.0,
+    "input_tokens_cv": 1.0,
+    "output_tokens_mean": 250.0,
+    "output_tokens_cv": 1.0,
+    "length_dist": "lognormal"
+  },
+  "mechanism": {
+    "ttl": 300.0,
+    "chunk_tokens": 64,
+    "min_cacheable_tokens": 0.0,
+    "mode": "auto",
+    "max_breakpoints": 4
+  },
+  "prices": {
+    "input": 1.0,
+    "cached_read": 0.1,
+    "cache_write": 1.0,
+    "output": 2.0
+  },
+  "policy": {
+    "name": "passthrough",
+    "window_max_tokens": 4000.0
+  }
+}
