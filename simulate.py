@@ -65,3 +65,36 @@ def run_average(scen: Scenario, seeds: int = 1) -> Result:
         for f in dataclasses.fields(Result):
             acc[f.name] = acc.get(f.name, 0.0) + getattr(r, f.name)
     return Result(**{k: v / seeds for k, v in acc.items()})
+
+
+POLICY_SECTIONS = ("workload", "mechanism", "prices", "policy")
+
+
+def with_policy(scen: Scenario, name: str) -> Scenario:
+    return dataclasses.replace(scen, policy=dataclasses.replace(scen.policy, name=name))
+
+
+def run_sweep(scen: Scenario, param: str, start: float, stop: float, steps: int,
+              policies: list[str], seeds: int = 1) -> list[dict]:
+    """沿一个参数扫描多个策略；返回行字典列表（CLI 与 GUI 共用）。"""
+    section, fieldname = param.split(".", 1) if "." in param else ("workload", param)
+    if section not in POLICY_SECTIONS:
+        raise ValueError(f"未知参数段: {section}；可用: {POLICY_SECTIONS}")
+    sec = getattr(scen, section)
+    if fieldname not in {f.name for f in dataclasses.fields(sec)}:
+        raise ValueError(f"{section} 没有参数 {fieldname}")
+    rows: list[dict] = []
+    n = max(1, steps)
+    for i in range(n):
+        v = start + (stop - start) * (i / (n - 1) if n > 1 else 0.0)
+        for pname in policies:
+            sc = dataclasses.replace(scen, **{section: dataclasses.replace(sec, **{fieldname: v})})
+            r = run_average(with_policy(sc, pname), seeds)
+            rows.append({
+                "value": round(v, 8),
+                "policy": pname,
+                "hit_ratio": round(r.hit_ratio, 4),
+                "cost_total": round(r.cost_total, 6),
+                "cost_per_req": round(r.cost_total / r.n_requests, 8) if r.n_requests else None,
+            })
+    return rows

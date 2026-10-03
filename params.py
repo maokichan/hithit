@@ -25,7 +25,14 @@ class Workload:
     input_tokens_cv: float = 1.0
     output_tokens_mean: float = 250.0     # 每请求输出 token 均值（并入下一轮历史）
     output_tokens_cv: float = 1.0
-    length_dist: str = "lognormal"        # lognormal | exponential | constant
+    length_dist: str = "lognormal"        # lognormal | exponential | constant（直方图字段设置时忽略）
+    # 直方图采样（profile 拟合产物）；设置后覆盖对应参数化分布
+    input_hist_edges: list[float] | None = None    # 长度 = 对应 weights 长度 + 1
+    input_hist_weights: list[float] | None = None
+    output_hist_edges: list[float] | None = None
+    output_hist_weights: list[float] | None = None
+    gap_hist_edges: list[float] | None = None      # 到达间隔（秒）；设置后替代指数到达
+    gap_hist_weights: list[float] | None = None
 
 
 @dataclass

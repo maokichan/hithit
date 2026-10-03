@@ -1,4 +1,4 @@
-"""CLI 入口：python3 -m hithit {selfcheck|demo|run|sweep}。"""
+"""CLI 入口：python3 -m hithit {selfcheck|demo|run|sweep|profile|fit}。"""
 from __future__ import annotations
 
 import argparse
@@ -8,14 +8,8 @@ import sys
 
 from .params import Scenario, load_scenario
 from .report import compare_table, sweep_table
-from .simulate import run, run_average
+from .simulate import run, run_average, run_sweep, with_policy
 from . import selfcheck as _selfcheck
-
-_SECTIONS = ("workload", "mechanism", "prices", "policy")
-
-
-def _with_policy(scen: Scenario, name: str) -> Scenario:
-    return dataclasses.replace(scen, policy=dataclasses.replace(scen.policy, name=name))
 
 
 def cmd_selfcheck(args) -> None:
@@ -26,7 +20,7 @@ def cmd_selfcheck(args) -> None:
 def cmd_demo(args) -> None:
     scen = Scenario()
     results = {
-        name: run_average(_with_policy(scen, name), args.seeds)
+        name: run_average(with_policy(scen, name), args.seeds)
         for name in ("passthrough", "sliding_window")
     }
     print("默认中性场景（价目为占位值；正式评估请写场景 JSON，用 run / sweep 传入）\n")
@@ -36,7 +30,7 @@ def cmd_demo(args) -> None:
 def cmd_run(args) -> None:
     scen = load_scenario(args.scenario)
     if args.policy:
-        scen = _with_policy(scen, args.policy)
+        scen = with_policy(scen, args.policy)
     if args.seed is not None:
         scen = dataclasses.replace(scen, seed=args.seed)
     print(json.dumps(dataclasses.asdict(scen), ensure_ascii=False, indent=1))
@@ -46,32 +40,38 @@ def cmd_run(args) -> None:
 
 def cmd_sweep(args) -> None:
     scen = load_scenario(args.scenario)
-    section, fieldname = args.param.split(".", 1) if "." in args.param else ("workload", args.param)
-    if section not in _SECTIONS:
-        sys.exit(f"未知参数段: {section}；可用: {_SECTIONS}")
-    sec = getattr(scen, section)
-    if fieldname not in {f.name for f in dataclasses.fields(sec)}:
-        sys.exit(f"{section} 没有参数 {fieldname}")
-    rows = []
-    n = max(1, args.steps)
-    for i in range(n):
-        v = args.start + (args.stop - args.start) * (i / (n - 1) if n > 1 else 0.0)
-        for pname in args.policies.split(","):
-            sc = dataclasses.replace(scen, **{section: dataclasses.replace(sec, **{fieldname: v})})
-            r = run_average(_with_policy(sc, pname), args.seeds)
-            rows.append({
-                "value": round(v, 8),
-                "policy": pname,
-                "hit_ratio": round(r.hit_ratio, 4),
-                "cost_total": round(r.cost_total, 6),
-                "cost_per_req": round(r.cost_total / r.n_requests, 8) if r.n_requests else "-",
-            })
+    rows = run_sweep(scen, args.param, args.start, args.stop, args.steps,
+                     [p.strip() for p in args.policies.split(",")], args.seeds)
     md, csv = sweep_table(rows)
     print(md)
     if args.csv:
         with open(args.csv, "w", encoding="utf-8") as f:
             f.write(csv)
         print(f"\nCSV 已写入 {args.csv}")
+
+
+def cmd_profile(args) -> None:
+    from .profile import build_profile, load_events
+
+    events = load_events(args.events)
+    prof = build_profile(events, args.chars_per_token, source=args.source or args.events)
+    with open(args.out, "w", encoding="utf-8") as f:
+        json.dump(prof, f, ensure_ascii=False, indent=1)
+    days = prof["window"]["seconds"] / 86400
+    print(f"画像已写入 {args.out}：会话 {prof['n_sessions']}，回合 {prof['n_turns']}，窗口 {days:.2f} 天")
+
+
+def cmd_fit(args) -> None:
+    from .fit import fit_scenario
+
+    with open(args.profile, encoding="utf-8") as f:
+        profile = json.load(f)
+    scenario, warnings = fit_scenario(profile, args.stable_prefix_tokens, args.sim_time_cap)
+    with open(args.out, "w", encoding="utf-8") as f:
+        json.dump(scenario, f, ensure_ascii=False, indent=1)
+    print(f"场景已写入 {args.out}")
+    for w in warnings:
+        print(f"注意: {w}")
 
 
 def main(argv=None) -> None:
@@ -101,6 +101,20 @@ def main(argv=None) -> None:
     s.add_argument("--seeds", type=int, default=3)
     s.add_argument("--csv", default=None, help="CSV 输出路径")
     s.set_defaults(fn=cmd_sweep)
+
+    s = sub.add_parser("profile", help="raw events JSONL → 特征画像 profile IR")
+    s.add_argument("events")
+    s.add_argument("-o", "--out", required=True)
+    s.add_argument("--chars-per-token", type=float, default=2.0, help="chars→tokens 折算系数")
+    s.add_argument("--source", default="", help="来源标注")
+    s.set_defaults(fn=cmd_profile)
+
+    s = sub.add_parser("fit", help="特征画像 profile IR → 场景 JSON")
+    s.add_argument("profile")
+    s.add_argument("-o", "--out", required=True)
+    s.add_argument("--stable-prefix-tokens", type=float, default=None)
+    s.add_argument("--sim-time-cap", type=float, default=604800.0, help="模拟窗口上限秒数")
+    s.set_defaults(fn=cmd_fit)
 
     args = p.parse_args(argv)
     args.fn(args)

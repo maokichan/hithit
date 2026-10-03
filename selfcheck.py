@@ -7,10 +7,13 @@
 from __future__ import annotations
 
 import math
+import random
+import statistics
 
 from .cache import ApiCache, Block
 from .params import CacheMechanism, PolicyConfig, PriceTable, Scenario, Workload
 from .simulate import run
+from .workload import sample_from_hist
 
 
 def _poisson_sf(j: int, mu: float) -> float:
@@ -47,6 +50,12 @@ def _unit_checks() -> None:
     )
     assert r7.matched == 10 and r7.written == 20 and r7.tail == 5, r7
 
+    # 直方图采样：均值回到理论值（0.9×50 + 0.1×5050 = 550）
+    rng = random.Random(1)
+    xs = [sample_from_hist(rng, [0.0, 100.0, 10000.0], [9.0, 1.0]) for _ in range(20000)]
+    mean = statistics.fmean(xs)
+    assert abs(mean - 550.0) / 550.0 < 0.05, mean
+
 
 def _analytic(scen: Scenario) -> dict:
     w, mech, pr = scen.workload, scen.mechanism, scen.prices
@@ -79,7 +88,7 @@ def _analytic(scen: Scenario) -> dict:
 
 def run_selfcheck() -> bool:
     _unit_checks()
-    print("单元检查：通过（TTL 过期 / chunk 粒度 / explicit 断点）")
+    print("单元检查：通过（TTL 过期 / chunk 粒度 / explicit 断点 / 直方图采样）")
 
     scen = Scenario(
         workload=Workload(
