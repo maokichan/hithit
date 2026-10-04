@@ -31,7 +31,8 @@ class Result:
         return self.matched_tokens / self.prompt_tokens if self.prompt_tokens else 0.0
 
 
-def run(scen: Scenario) -> Result:
+def run(scen: Scenario, trace: list | None = None) -> Result:
+    """跑一次模拟。trace 传入 list 时逐请求追加记录（t/session/prompt/matched/hit/cost）。"""
     res = Result()
     reqs = generate_requests(scen.workload, scen.seed)
     cache = ApiCache(scen.mechanism)
@@ -53,6 +54,16 @@ def run(scen: Scenario) -> Result:
         res.cost_write += m.written * pr.cache_write / 1e6
         res.cost_output += r.output_tokens * pr.output / 1e6
         policy.observe(st, r, scen.workload)
+        if trace is not None:
+            trace.append({
+                "t": r.t,
+                "session": r.session,
+                "prompt": m.prompt_tokens,
+                "matched": m.matched,
+                "hit": m.matched / m.prompt_tokens if m.prompt_tokens else 0.0,
+                "cost": (m.tail * pr.input + m.matched * pr.cached_read
+                         + m.written * pr.cache_write + r.output_tokens * pr.output) / 1e6,
+            })
     return res
 
 

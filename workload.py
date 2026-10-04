@@ -26,7 +26,7 @@ def _sample_length(rng: random.Random, mean: float, cv: float, dist: str) -> flo
         sigma = math.sqrt(math.log1p(cv * cv))
         mu = math.log(mean) - sigma * sigma / 2.0
         return rng.lognormvariate(mu, sigma)
-    raise ValueError(f"未知长度分布: {dist}")
+    raise ValueError(f"未知长度分布: {dist}（若为 histogram：直方图字段缺失，需提供 *_hist_edges/*_hist_weights）")
 
 
 def per_session_rates(w: Workload, rng: random.Random) -> list[float]:
