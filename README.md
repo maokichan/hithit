@@ -66,7 +66,7 @@ python3 -m hithit.gui
 | `policies.py` | 策略接口 + 两个参照策略 |
 | `simulate.py` | 离散事件主循环、多种子平均、参数扫描（CLI/GUI 共用） |
 | `ir.py` / `profile.py` / `fit.py` | 中间数据表示层：raw events → 画像 → 场景拟合 |
-| `gui.py` | tkinter 图形界面 |
+| `gui.py` | 图形界面：模拟（业务参数面板，改参数自动出折线 + 丢弃-经济曲线）/ 画像拟合 / 假设页 |
 | `report.py` / `selfcheck.py` | 对比表与扫描表；机制单元检查 + 解析对照 |
 | `examples/` | 合成样例（生成脚本 + 各级产物），演示全管道 |
 

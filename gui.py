@@ -1,15 +1,13 @@
-"""tkinter 图形界面：运行 / 扫描 / 画像拟合 三个页签。
+"""tkinter 图形界面：模拟 / 画像拟合 / 假设 三页。
+
+设计原则（2026-10-05 与需求方对齐）：
+- 目标函数是**经济性**（钱）。命中率只是形成成本的机制之一——丢弃信息同样省钱，
+  因此默认提供"丢弃-经济曲线"（历史保留量 → 每请求成本）直接回答"丢多少最划算"。
+- **参数即输入、折线即输出**：改任何参数自动重算重画，没有"运行/扫描"步骤。
+- 参数用业务语言（群数量、@ 频率、系统提示长度、缓存保留分钟数）。
+- 建模自带假设单列一页，解读任何结论前先读它。
 
 用法：python3 -m hithit.gui
-需要 python3-tk 与显示服务器（本机 headless 可 ssh -X，或把仓库克隆到桌面机运行）。
-
-交互：
-- 运行页左侧参数编辑器可手动改全部标量参数（负载/机制/价目/策略），打开即可改即跑；
-  直方图字段（*_hist_*）不在编辑器内，含直方图的场景请走 JSON 路径。
-- 运行页可勾选「时序记录（单种子）」：逐请求成本/命中率时序图，支持回放
-  （▶ 播放/暂停、倍速），能看到冷启动、断裂、恢复的过程。
-- 图表通用交互：悬停读数、按住拖动平移、滚轮缩放、双击复位。
-- Windows 高 DPI（125%/150% 缩放）下启用 DPI 感知，窗口尺寸自适应屏幕。
 """
 from __future__ import annotations
 
@@ -17,14 +15,14 @@ import ctypes
 import dataclasses
 import json
 import sys
+import time
 import tkinter as tk
 from collections import deque
 from tkinter import filedialog, messagebox, ttk
 
 from .fit import fit_scenario
-from .params import (CacheMechanism, PolicyConfig, PriceTable, Scenario,
-                     Workload, load_scenario, scenario_from_dict)
-from .simulate import run, run_average, run_sweep, with_policy
+from .params import Scenario, load_scenario, scenario_from_dict
+from .simulate import run, run_average, with_policy
 
 if sys.platform == "win32":
     try:
@@ -35,53 +33,40 @@ if sys.platform == "win32":
         except Exception:
             pass
 
-POLICIES = ("passthrough", "sliding_window")
-POLICY_HELP = {
-    "passthrough": "全历史直通：每轮 prompt = 稳定前缀 + 全部历史 + 本轮新输入。前缀只追加不变 → 命中率最高；但 prompt 随会话无限变长，每请求成本持续上升（基线 1）。",
-    "sliding_window": "滑动窗口：历史超出 window_max_tokens 就截掉最老部分。prompt 长度封顶；但每次截断 = 前缀断裂（从截断点起全 miss 重建），命中率低于直通（基线 2）。",
-}
 COLORS = ("#2563eb", "#dc2626", "#059669", "#d97706", "#7c3aed")
-TREE_COLS = ("策略", "请求数", "命中率", "未命中输入", "命中读", "写入", "输出", "总成本", "每请求成本")
-HIST_FIELDS = ("input_hist_edges", "input_hist_weights", "output_hist_edges",
-               "output_hist_weights", "gap_hist_edges", "gap_hist_weights")
-_SECTIONS = (("负载 workload", Workload, "workload"),
-             ("机制 mechanism", CacheMechanism, "mechanism"),
-             ("价目 prices（币种 / 1M token）", PriceTable, "prices"),
-             ("策略 policy", PolicyConfig, "policy"))
-_CONV = {"int": int, "float": float, "str": str}
-METRICS = ("每请求成本", "累计成本", "命中率")
-SPEEDS = {"1x": 1, "2x": 2, "4x": 4, "8x": 8}
 PLOT_HINT = "悬停读数 · 拖动平移 · 滚轮缩放 · 双击复位"
+METRICS = ("累计成本", "每请求成本", "命中率")
+SPEEDS = {"1x": 1, "2x": 2, "4x": 4, "8x": 8}
+ECON_POINTS = 14
+AUTO_MS = 280  # 参数变化后的防抖
 
+ASSUMPTIONS_TEXT = """建模自带假设（解读任何结论前先读）
 
-def _result_row(name, r) -> list:
-    return [
-        name,
-        int(r.n_requests),
-        f"{r.hit_ratio:.1%}",
-        f"{r.cost_input:.4g}",
-        f"{r.cost_cached:.4g}",
-        f"{r.cost_write:.4g}",
-        f"{r.cost_output:.4g}",
-        f"{r.cost_total:.4g}",
-        f"{r.cost_total / r.n_requests:.4g}" if r.n_requests else "-",
-    ]
+1. 到达 = 泊松（指数间隔）：无突发、无昼夜周期、各轮独立。
+   影响：真实群聊的连发与作息会让"间歇活跃群"的 TTL 损耗比模拟更差；
+   模拟给出的是偏乐观的平滑世界。
 
+2. 长度 = 对数正态、逐轮独立采样（cv=1）：历史之间无相关性。
+   影响：历史增长是理想均匀的"每月长这么多"，真实话题聚集会造成偏差。
 
-def _fmt(v) -> str:
-    return f"{v:.8g}" if isinstance(v, float) else str(v)
+3. 触发时机 = 外生负载参数："@ 频率"是你给的，不是被评估的策略。
+   主动回复频率、防抖、作息窗口目前**不能**被建模评估——要回答
+   "什么时候主动发请求最经济"，需要把触发策略内生化（已知建模缺口）。
 
+4. 缓存 = 容量无限、单档 TTL、路由必中（α=1）、无峰谷价、无跨账号差异。
+   影响：对 DeepSeek（磁盘缓存）近似成立；对内存缓存厂商偏乐观。
 
-def _sweepable_params() -> list[str]:
-    out = []
-    for _, cls, prefix in _SECTIONS:
-        for f in dataclasses.fields(cls):
-            if f.type in ("int", "float"):
-                out.append(f"{prefix}.{f.name}")
-    return out
+5. 目标函数 = 经济性（钱），不是命中率：命中率高不等于省钱——
+   丢弃历史让 prompt 变短，即使全价也可能更便宜。看"每请求成本"下结论，
+   命中率只用来解释成本为什么是这样。
 
+6. 比较的基线只有两个参照策略（直通 = 全保留、滑窗 = 超限即丢），
+   它们是验证工具用的标尺，不是推荐方案；真实策略（冻结块链等）待接入。
 
-SWEEP_PARAMS = _sweepable_params()
+共同词汇见 docs/05-词表.md（"先入表再使用"）。
+"""
+
+ASSUME_TITLE = ("Microsoft YaHei UI", 10)
 
 
 def _moving_avg(ys: list[float], w: int) -> list[float]:
@@ -100,7 +85,7 @@ def _moving_avg(ys: list[float], w: int) -> list[float]:
 class PlotWidget(tk.Canvas):
     """折线图控件：多条曲线、悬停读数、拖动平移、滚轮缩放、双击复位、逐步揭示（回放）。"""
 
-    MAX_POINTS = 600  # 超过则等距抽稀，保证拖动流畅
+    MAX_POINTS = 600
 
     def __init__(self, parent, height=None):
         super().__init__(parent, bg="white", highlightthickness=0, cursor="crosshair")
@@ -109,8 +94,8 @@ class PlotWidget(tk.Canvas):
         self.series: dict[str, list[tuple[float, float]]] = {}
         self.xlabel = ""
         self.yname = ""
-        self.view = None            # (x0,x1,y0,y1) 数据坐标；None=自动适配
-        self.reveal = None          # None=全部；int=只显示前 n 个点（回放）
+        self.view = None
+        self.reveal = None
         self._plot = None
         self._pts: list[tuple] = []
         self._drag = None
@@ -161,7 +146,6 @@ class PlotWidget(tk.Canvas):
         h = max(self.winfo_height(), 120)
         xs = [p[0] for p in pts]
         ys = [p[1] for p in pts]
-        # 回放时锁全量范围（轴不跳动）；平时用用户视图或自动适配
         if self.reveal is not None or self.view is None:
             x0, x1 = min(xs), max(xs)
             y0, y1 = min(ys), max(ys)
@@ -202,7 +186,7 @@ class PlotWidget(tk.Canvas):
                     c.create_line(*last, px, py, fill=color, width=2)
                 c.create_oval(px - 2, py - 2, px + 2, py + 2, fill=color, outline="")
                 last = (px, py)
-            c.create_text(w - 150, 12 + i * 16, text=f"■ {name}", anchor="w", fill=color, font=("", 9))
+            c.create_text(w - 170, 12 + i * 16, text=f"■ {name}", anchor="w", fill=color, font=("", 9))
         c.create_text(pad + 4, 8, text=PLOT_HINT, anchor="w", fill="#aaa", font=("", 8))
 
     def _on_motion(self, e) -> None:
@@ -266,7 +250,7 @@ class PlotWidget(tk.Canvas):
 class App(tk.Tk):
     def __init__(self):
         super().__init__()
-        self.title("hithit — 缓存命中建模")
+        self.title("hithit — 缓存经济建模")
         try:
             self.tk.call("tk", "scaling", self.winfo_fpixels("1i") / 72.0)
         except tk.TclError:
@@ -282,107 +266,60 @@ class App(tk.Tk):
 
         nb = ttk.Notebook(self)
         nb.pack(fill="both", expand=True)
-        self.tab_run = ttk.Frame(nb)
-        self.tab_sweep = ttk.Frame(nb)
+        self.tab_main = ttk.Frame(nb)
         self.tab_fit = ttk.Frame(nb)
-        nb.add(self.tab_run, text="运行")
-        nb.add(self.tab_sweep, text="扫描")
+        self.tab_assume = ttk.Frame(nb)
+        nb.add(self.tab_main, text="模拟")
         nb.add(self.tab_fit, text="画像拟合")
-        self._build_run()
-        self._build_sweep()
+        nb.add(self.tab_assume, text="假设（先读）")
+
+        self._build_main()
         self._build_fit()
-        self.status = tk.StringVar(value="就绪")
+        self._build_assume()
+
+        self.status = tk.StringVar(value="就绪：拖动左侧任何参数，右侧两条折线自动重算")
         ttk.Label(self, textvariable=self.status, anchor="w", padding=(8, 2)).pack(fill="x")
-        # 时序回放状态
+
         self.traces: dict[str, list] = {}
         self._playing = False
         self._play_i = 0
+        self._pending = None
+        self.after(200, self._recompute)  # 打开即出默认折线
 
-    def _set_status(self, text: str) -> None:
-        self.status.set(text)
-        self.update_idletasks()
+    # ---------- 参数面板（业务语言） ----------
+    _SLIDERS = (
+        # (var 名, 标签, 单位, min, max, 初值, int?)
+        ("v_sessions", "会话（群）数量", "个", 1, 200, 30, True),
+        ("v_period", "@ 频率：每多少分钟一轮", "分钟/轮/群", 1, 720, 15, True),
+        ("v_hours", "模拟时长", "小时", 1, 72, 24, True),
+        ("v_stable", "系统提示长度（角色卡等，跨群共享）", "token", 0, 8000, 1000, True),
+        ("v_input", "每轮用户输入", "token", 10, 2000, 150, True),
+        ("v_output", "每轮 bot 回复", "token", 10, 4000, 250, True),
+        ("v_window", "历史保留上限（超出的丢掉；经济曲线横轴就是它）", "token", 0, 20000, 4000, True),
+        ("v_ttl", "缓存保留（命中会续期）", "分钟", 1, 2880, 480, True),
+        ("v_chunk", "缓存匹配粒度", "token", 1, 256, 64, True),
+        ("v_mincache", "最短可缓存前缀", "token", 0, 4096, 256, True),
+    )
+    _PRICES = (
+        ("v_p_in", "输入价（未命中，¥/1M tok）", "2.0"),
+        ("v_p_hit", "命中价（¥/1M tok）", "0.03"),
+        ("v_p_write", "写入价（含读取成本，¥/1M tok）", "2.0"),
+        ("v_p_out", "输出价（¥/1M tok）", "4.0"),
+    )
 
-    def _pick_file(self, entry: ttk.Entry) -> None:
-        path = filedialog.askopenfilename(filetypes=[("JSON", "*.json")])
-        if path:
-            entry.delete(0, "end")
-            entry.insert(0, path)
-
-    @staticmethod
-    def _make_tree(parent, cols, height=8) -> ttk.Treeview:
-        wrap = ttk.Frame(parent)
-        wrap.pack(fill="both", expand=True)
-        tree = ttk.Treeview(wrap, columns=cols, show="headings", height=height)
-        for i, c in enumerate(cols):
-            tree.heading(c, text=c)
-            tree.column(c, width=110, anchor="w" if i == 0 else "e")
-        ysb = ttk.Scrollbar(wrap, orient="vertical", command=tree.yview)
-        tree.configure(yscrollcommand=ysb.set)
-        tree.pack(side="left", fill="both", expand=True)
-        ysb.pack(side="left", fill="y")
-        return tree
-
-    # ---------- 运行页 ----------
-    def _build_run(self) -> None:
-        f = self.tab_run
-        top = ttk.Frame(f, padding=8)
-        top.pack(fill="x")
-        ttk.Label(top, text="场景 JSON:").pack(side="left")
-        self.run_scenario = ttk.Entry(top)
-        self.run_scenario.pack(side="left", fill="x", expand=True, padx=4)
-        ttk.Button(top, text="浏览…", command=lambda: self._pick_file(self.run_scenario)).pack(side="left")
-        ttk.Button(top, text="载入到编辑器", command=self.on_load_editor).pack(side="left", padx=(6, 0))
-
-        opts = ttk.Frame(f, padding=(8, 0))
-        opts.pack(fill="x")
-        self.run_compare = tk.BooleanVar(value=True)
-        ttk.Checkbutton(opts, text="对比全部参照策略", variable=self.run_compare).pack(side="left")
-        ttk.Label(opts, text="种子数:").pack(side="left", padx=(12, 2))
-        self.run_seeds = tk.StringVar(value="3")
-        ttk.Spinbox(opts, from_=1, to=50, textvariable=self.run_seeds, width=5).pack(side="left")
-        self.run_trace = tk.BooleanVar(value=False)
-        ttk.Checkbutton(opts, text="时序记录（单种子）", variable=self.run_trace).pack(side="left", padx=(12, 0))
-        ttk.Button(opts, text="运行（JSON）", command=self.on_run_json).pack(side="left", padx=12)
-
+    def _build_main(self) -> None:
+        f = self.tab_main
         paned = ttk.PanedWindow(f, orient="horizontal")
-        paned.pack(fill="both", expand=True, padx=8, pady=(4, 8))
+        paned.pack(fill="both", expand=True, padx=6, pady=6)
         left = ttk.Frame(paned)
         right = ttk.Frame(paned)
         paned.add(left, weight=0)
         paned.add(right, weight=1)
-        self._build_editor(left)
 
-        vpan = ttk.PanedWindow(right, orient="vertical")
-        vpan.pack(fill="both", expand=True)
-        tree_wrap = ttk.Frame(vpan)
-        vpan.add(tree_wrap, weight=3)
-        self.run_tree = self._make_tree(tree_wrap, TREE_COLS)
-        chart = ttk.Frame(vpan)
-        vpan.add(chart, weight=2)
-
-        bar = ttk.Frame(chart, padding=(0, 2))
-        bar.pack(fill="x")
-        ttk.Label(bar, text="时序图:").pack(side="left")
-        self.trace_metric = tk.StringVar(value=METRICS[0])
-        ttk.Combobox(bar, textvariable=self.trace_metric, values=METRICS, width=10,
-                     state="readonly").pack(side="left", padx=(2, 8))
-        self.trace_metric.trace_add("write", lambda *_: self._update_trace_plot())
-        self.trace_smooth = tk.BooleanVar(value=False)
-        ttk.Checkbutton(bar, text="平滑", variable=self.trace_smooth,
-                        command=self._update_trace_plot).pack(side="left")
-        self.play_btn = ttk.Button(bar, text="▶ 回放", command=self._toggle_play, state="disabled")
-        self.play_btn.pack(side="left", padx=8)
-        ttk.Label(bar, text="倍速:").pack(side="left")
-        self.trace_speed = tk.StringVar(value="4x")
-        ttk.Combobox(bar, textvariable=self.trace_speed, values=tuple(SPEEDS), width=3,
-                     state="readonly").pack(side="left", padx=(2, 0))
-        self.plot_run = PlotWidget(chart, height=190)
-        self.plot_run.pack(fill="both", expand=True)
-
-    def _build_editor(self, parent) -> None:
-        outer = ttk.Frame(parent)
+        # 左：滚动参数面板
+        outer = ttk.Frame(left)
         outer.pack(fill="both", expand=True)
-        canvas = tk.Canvas(outer, width=370, highlightthickness=0, bg="#f7f7f7")
+        canvas = tk.Canvas(outer, width=340, highlightthickness=0, bg="#f7f7f7")
         vsb = ttk.Scrollbar(outer, orient="vertical", command=canvas.yview)
         canvas.configure(yscrollcommand=vsb.set)
         vsb.pack(side="right", fill="y")
@@ -390,54 +327,70 @@ class App(tk.Tk):
         inner = ttk.Frame(canvas, padding=4)
         win = canvas.create_window((0, 0), window=inner, anchor="nw")
         inner.bind("<Configure>", lambda e: canvas.configure(scrollregion=canvas.bbox("all")))
-        canvas.bind("<Configure>", lambda e: canvas.itemconfigure(win, width=max(e.width, 370)))
+        canvas.bind("<Configure>", lambda e: canvas.itemconfigure(win, width=max(e.width, 340)))
 
         def _wheel(e):
             canvas.yview_scroll(-1 if e.delta > 0 else 1, "units")
 
-        defaults = Scenario()
-        self.ed_vars: dict[str, list] = {}
-        for title, cls, key in _SECTIONS:
-            box = ttk.LabelFrame(inner, text=title, padding=4)
-            box.pack(fill="x", pady=3)
-            section = getattr(defaults, key)
-            self.ed_vars[key] = []
-            extra_row = 0
-            for fd in dataclasses.fields(cls):
-                if fd.type not in _CONV:
-                    continue
-                conv = _CONV[fd.type]
-                var = tk.StringVar(value=_fmt(getattr(section, fd.name)))
-                ttk.Label(box, text=fd.name).grid(row=extra_row, column=0, sticky="w", padx=2, pady=1)
-                if key == "policy" and fd.name == "name":
-                    w = ttk.Combobox(box, textvariable=var, values=POLICIES, width=10)
-                    w.bind("<<ComboboxSelected>>", lambda e: self._update_policy_help())
-                else:
-                    w = ttk.Entry(box, textvariable=var, width=12)
-                w.grid(row=extra_row, column=1, sticky="ew", padx=2, pady=1)
-                box.columnconfigure(1, weight=1)
-                self.ed_vars[key].append((fd.name, conv, var))
-                extra_row += 1
-            if key == "workload":
-                self._hint(box, "直方图字段（*_hist_*）不在编辑器：含直方图的场景请用「运行（JSON）」。",
-                           row=extra_row, column=0, columnspan=2, sticky="w", pady=(4, 0))
-            elif key == "prices":
-                self._hint(box, "cache_write 含所写 token 的读取成本：无写溢价设 = input；"
-                                "1.25× 写溢价方案设 = 1.25×input。",
-                           row=extra_row, column=0, columnspan=2, sticky="w", pady=(4, 0))
-            elif key == "policy":
-                self.policy_help = self._hint(box, POLICY_HELP[defaults.policy.name],
-                                              row=extra_row, column=0, columnspan=2, sticky="w", pady=(4, 0))
+        self.slider_vars = {}
+        for attr, label, unit, lo, hi, init, is_int in self._SLIDERS:
+            var = tk.IntVar(value=init) if is_int else tk.DoubleVar(value=init)
+            setattr(self, attr, var)
+            self.slider_vars[attr] = var
+            box = ttk.LabelFrame(inner, text=f"{label}（{unit}）", padding=(6, 1))
+            box.pack(fill="x", pady=2)
+            sc = tk.Scale(box, variable=var, from_=lo, to=hi, orient="horizontal",
+                          resolution=1 if is_int else 0.5, showvalue=True)
+            sc.pack(fill="x")
+            var.trace_add("write", self._schedule)
+        self.v_sessions: tk.IntVar
+        self.v_period: tk.IntVar
+        self.v_hours: tk.IntVar
+        self.v_stable: tk.IntVar
+        self.v_input: tk.IntVar
+        self.v_output: tk.IntVar
+        self.v_window: tk.IntVar
+        self.v_ttl: tk.IntVar
+        self.v_chunk: tk.IntVar
+        self.v_mincache: tk.IntVar
 
-        sbox = ttk.LabelFrame(inner, text="随机种子 seed", padding=4)
-        sbox.pack(fill="x", pady=3)
-        self.ed_seed = tk.StringVar(value=str(defaults.seed))
-        ttk.Spinbox(sbox, from_=0, to=10 ** 9, textvariable=self.ed_seed, width=12).pack(anchor="w")
+        pbox = ttk.LabelFrame(inner, text="价目（¥ / 1M token；DeepSeek 示例价，用前复核）", padding=(6, 2))
+        pbox.pack(fill="x", pady=2)
+        for attr, label, init in self._PRICES:
+            row = ttk.Frame(pbox)
+            row.pack(fill="x", pady=1)
+            ttk.Label(row, text=label, width=30).pack(side="left")
+            var = tk.StringVar(value=init)
+            setattr(self, attr, var)
+            ttk.Entry(row, textvariable=var, width=8).pack(side="right")
+            var.trace_add("write", self._schedule)
+        self.v_p_in: tk.StringVar
+        self.v_p_hit: tk.StringVar
+        self.v_p_write: tk.StringVar
+        self.v_p_out: tk.StringVar
 
-        btns = ttk.Frame(inner)
-        btns.pack(fill="x", pady=6)
-        ttk.Button(btns, text="▶ 运行（编辑器参数）", command=self.on_run_editor).pack(side="left", padx=2)
-        ttk.Button(btns, text="保存编辑器为 JSON…", command=self.on_save_editor).pack(side="left", padx=2)
+        mbox = ttk.LabelFrame(inner, text="写入模式", padding=(6, 2))
+        mbox.pack(fill="x", pady=2)
+        self.v_mode = tk.StringVar(value="auto")
+        ttk.Combobox(mbox, textvariable=self.v_mode, values=("auto", "explicit"),
+                     state="readonly", width=10).pack(anchor="w")
+        self.v_mode.trace_add("write", self._schedule)
+
+        sbox = ttk.LabelFrame(inner, text="随机世界编号（seed）", padding=(6, 2))
+        sbox.pack(fill="x", pady=2)
+        row = ttk.Frame(sbox)
+        row.pack(fill="x")
+        self.v_seed = tk.IntVar(value=42)
+        ttk.Spinbox(row, from_=0, to=10 ** 9, textvariable=self.v_seed, width=8).pack(side="left")
+        ttk.Button(row, text="换一个世界", command=self._next_world).pack(side="left", padx=6)
+        self.v_seed.trace_add("write", self._schedule)
+
+        jbox = ttk.Frame(inner)
+        jbox.pack(fill="x", pady=6)
+        ttk.Button(jbox, text="从场景 JSON 载入…", command=self.on_load_json).pack(side="left")
+        ttk.Label(inner, text="自动重算：拖动停止约 0.3 秒后刷新两条折线。\n"
+                              "经济曲线横轴 = 「历史保留上限」滑块的范围同一含义。",
+                  wraplength=320, justify="left", foreground="#555", font=("", 8)).pack(anchor="w", pady=4)
 
         def _bind_wheel(w):
             if isinstance(w, (ttk.Combobox, ttk.Spinbox, tk.Spinbox)):
@@ -449,138 +402,152 @@ class App(tk.Tk):
         _bind_wheel(inner)
         _bind_wheel(canvas)
 
-    @staticmethod
-    def _hint(parent, text, **grid) -> tk.Label:
-        lbl = tk.Label(parent, text=text, wraplength=330, justify="left", fg="#555", font=("", 8))
-        lbl.grid(**grid)
-        return lbl
+        # 右：时序图 + 经济曲线
+        vpan = ttk.PanedWindow(right, orient="vertical")
+        vpan.pack(fill="both", expand=True)
+        tzone = ttk.Frame(vpan)
+        vpan.add(tzone, weight=3)
+        bar = ttk.Frame(tzone, padding=(0, 2))
+        bar.pack(fill="x")
+        ttk.Label(bar, text="时序图:").pack(side="left")
+        self.trace_metric = tk.StringVar(value=METRICS[0])
+        ttk.Combobox(bar, textvariable=self.trace_metric, values=METRICS, width=10,
+                     state="readonly").pack(side="left", padx=(2, 8))
+        self.trace_metric.trace_add("write", lambda *_: self._update_trace_plot())
+        self.trace_smooth = tk.BooleanVar(value=False)
+        ttk.Checkbutton(bar, text="平滑", variable=self.trace_smooth,
+                        command=self._update_trace_plot).pack(side="left")
+        self.play_btn = ttk.Button(bar, text="▶ 回放", command=self._toggle_play)
+        self.play_btn.pack(side="left", padx=8)
+        ttk.Label(bar, text="倍速:").pack(side="left")
+        self.trace_speed = tk.StringVar(value="4x")
+        ttk.Combobox(bar, textvariable=self.trace_speed, values=tuple(SPEEDS), width=3,
+                     state="readonly").pack(side="left", padx=(2, 0))
+        self.plot_run = PlotWidget(tzone, height=200)
+        self.plot_run.pack(fill="both", expand=True)
 
-    def _update_policy_help(self) -> None:
-        name = self.ed_vars["policy"][0][2].get().strip()  # policy.name 的 var
-        self.policy_help.config(text=POLICY_HELP.get(
-            name, f"「{name}」不是内置参照策略；内置仅 passthrough / sliding_window，自定义策略经策略接口接入后可用。"))
+        econ = ttk.Frame(vpan)
+        vpan.add(econ, weight=2)
+        ttk.Label(econ, text="丢弃-经济曲线：历史保留多少最省钱？（蓝线最低点 = 最优丢弃量；红虚线 = 全保留参考）",
+                  padding=(0, 2)).pack(anchor="w")
+        self.plot_econ = PlotWidget(econ, height=170)
+        self.plot_econ.pack(fill="both", expand=True)
 
-    def _fill_editor(self, scen: Scenario) -> None:
-        for key, items in self.ed_vars.items():
-            section = getattr(scen, key)
-            for fname, _conv, var in items:
-                var.set(_fmt(getattr(section, fname)))
-        self.ed_seed.set(str(scen.seed))
-        self._update_policy_help()
+    def _next_world(self) -> None:
+        self.v_seed.set(self.v_seed.get() + 1)
 
-    def _collect_editor(self) -> dict:
-        data = {}
-        for key, items in self.ed_vars.items():
-            vals = {}
-            for fname, conv, var in items:
-                raw = var.get().strip()
-                try:
-                    vals[fname] = conv(raw)
-                except (TypeError, ValueError):
-                    raise ValueError(f"{key}.{fname}: {raw!r} 不是合法 {conv.__name__}")
-            data[key] = vals
-        if data["workload"]["length_dist"] == "histogram":
-            raise ValueError(
-                "编辑器不含直方图字段（*_hist_*），length_dist=histogram 无法运行。\n"
-                "请把 length_dist 改为 lognormal / exponential / constant，或直接「运行（JSON）」保留直方图。")
-        try:
-            data["seed"] = int(self.ed_seed.get())
-        except ValueError:
-            raise ValueError(f"seed: {self.ed_seed.get()!r} 不是合法 int")
-        return data
+    def _collect(self) -> Scenario:
+        data = {
+            "seed": int(self.v_seed.get()),
+            "workload": {
+                "n_sessions": int(self.v_sessions.get()),
+                "sim_time": float(self.v_hours.get()) * 3600.0,
+                "request_rate": 1.0 / (float(self.v_period.get()) * 60.0),
+                "stable_prefix_tokens": float(self.v_stable.get()),
+                "input_tokens_mean": float(self.v_input.get()),
+                "input_tokens_cv": 1.0,
+                "output_tokens_mean": float(self.v_output.get()),
+                "output_tokens_cv": 1.0,
+                "length_dist": "lognormal",
+            },
+            "mechanism": {
+                "ttl": float(self.v_ttl.get()) * 60.0,
+                "chunk_tokens": int(self.v_chunk.get()),
+                "min_cacheable_tokens": float(self.v_mincache.get()),
+                "mode": self.v_mode.get(),
+                "max_breakpoints": 4,
+            },
+            "prices": {
+                "input": float(self.v_p_in.get()),
+                "cached_read": float(self.v_p_hit.get()),
+                "cache_write": float(self.v_p_write.get()),
+                "output": float(self.v_p_out.get()),
+            },
+            "policy": {
+                "name": "sliding_window",
+                "window_max_tokens": float(self.v_window.get()),
+            },
+        }
+        return scenario_from_dict(data)
 
-    def _get_seeds(self) -> int:
-        try:
-            return max(1, int(self.run_seeds.get()))
-        except ValueError:
-            raise ValueError("种子数不是整数")
-
-    def on_load_editor(self) -> None:
-        try:
-            scen = load_scenario(self.run_scenario.get().strip())
-        except Exception as e:
-            messagebox.showerror("加载失败", str(e))
-            return
-        self._fill_editor(scen)
-        if any(getattr(scen.workload, f) is not None for f in HIST_FIELDS):
-            messagebox.showwarning(
-                "直方图字段",
-                "该场景含直方图字段（*_hist_*），编辑器不覆盖它们。\n"
-                "用「运行（编辑器参数）」会丢掉直方图、退回参数化分布；要保留直方图请直接「运行（JSON）」。")
-        self._set_status("已载入编辑器")
-
-    def on_run_editor(self) -> None:
-        try:
-            scen = scenario_from_dict(self._collect_editor())
-            seeds = self._get_seeds()
-        except Exception as e:
-            messagebox.showerror("参数错误", str(e))
-            return
-        names = POLICIES if self.run_compare.get() else (scen.policy.name,)
-        self._run_and_fill(scen, names, seeds)
-
-    def on_run_json(self) -> None:
-        try:
-            scen = load_scenario(self.run_scenario.get().strip())
-            seeds = self._get_seeds()
-        except Exception as e:
-            messagebox.showerror("加载失败", str(e))
-            return
-        names = POLICIES if self.run_compare.get() else (scen.policy.name,)
-        self._run_and_fill(scen, names, seeds)
-
-    def on_save_editor(self) -> None:
-        try:
-            data = self._collect_editor()
-        except Exception as e:
-            messagebox.showerror("参数错误", str(e))
-            return
-        path = filedialog.asksaveasfilename(
-            defaultextension=".json", filetypes=[("JSON", "*.json")], initialfile="scenario.json")
+    def on_load_json(self) -> None:
+        path = filedialog.askopenfilename(filetypes=[("JSON", "*.json")])
         if not path:
             return
-        with open(path, "w", encoding="utf-8") as fh:
-            json.dump(data, fh, ensure_ascii=False, indent=1)
-        self._set_status(f"场景已保存: {path}")
-
-    def _run_and_fill(self, scen, names, seeds) -> None:
-        self._set_status(f"运行中：{len(names)} 个策略 × {seeds} 种子 …")
-        self.config(cursor="watch")
-        self.update_idletasks()
         try:
-            results = {n: run_average(with_policy(scen, n), seeds) for n in names}
+            scen = load_scenario(path)
         except Exception as e:
-            self.config(cursor="")
-            self._set_status("失败")
-            messagebox.showerror("运行失败", str(e))
+            messagebox.showerror("加载失败", str(e))
             return
-        self.config(cursor="")
-        tree = self.run_tree
-        tree.delete(*tree.get_children())
-        for n, r in results.items():
-            tree.insert("", "end", values=_result_row(n, r))
-        msg = f"完成：{len(names)} 个策略，每次运行 {int(results[names[0]].n_requests)} 请求"
-        if self.run_trace.get():
-            self._record_traces(scen, names)
-            msg += "；时序已记录，可回放"
-        self._set_status(msg)
+        wl = scen.workload
+        hist = any(getattr(wl, f) is not None for f in
+                   ("input_hist_edges", "input_hist_weights", "output_hist_edges",
+                    "output_hist_weights", "gap_hist_edges", "gap_hist_weights"))
+        if hist:
+            messagebox.showwarning(
+                "直方图场景", "该场景含直方图分布，业务面板不覆盖直方图；"
+                             "已载入可载入的参数，直方图部分请走 CLI（hithit run）。")
+        self.v_sessions.set(max(1, min(200, round(wl.n_sessions))))
+        self.v_period.set(max(1, min(720, round(1.0 / (wl.request_rate * 60.0)))))
+        self.v_hours.set(max(1, min(72, round(wl.sim_time / 3600.0))))
+        self.v_stable.set(max(0, min(8000, round(wl.stable_prefix_tokens))))
+        if wl.input_hist_edges is None:
+            self.v_input.set(max(10, min(2000, round(wl.input_tokens_mean))))
+        if wl.output_hist_edges is None:
+            self.v_output.set(max(10, min(4000, round(wl.output_tokens_mean))))
+        self.v_ttl.set(max(1, min(2880, round(scen.mechanism.ttl / 60.0))))
+        self.v_chunk.set(max(1, min(256, scen.mechanism.chunk_tokens)))
+        self.v_mincache.set(max(0, min(4096, round(scen.mechanism.min_cacheable_tokens))))
+        self.v_mode.set(scen.mechanism.mode if scen.mechanism.mode in ("auto", "explicit") else "auto")
+        self.v_seed.set(scen.seed)
+        self._set_status(f"已从 JSON 载入：{path}")
 
-    def _record_traces(self, scen, names) -> None:
+    def _schedule(self, *_):
+        if self._pending is not None:
+            self.after_cancel(self._pending)
+        self._pending = self.after(AUTO_MS, self._recompute)
+
+    # ---------- 自动重算 ----------
+    def _recompute(self) -> None:
+        self._pending = None
         self._stop_play(reset=True)
-        self.traces = {}
         try:
-            for n in names:
-                tr: list = []
-                run(with_policy(scen, n), trace=tr)
-                self.traces[n] = tr
+            scen = self._collect()
         except Exception as e:
-            messagebox.showerror("时序记录失败", str(e))
+            self._set_status(f"参数无效：{e}")
+            return
+        t0 = time.perf_counter()
+        self.traces = {}
+        for n in ("passthrough", "sliding_window"):
+            tr: list = []
+            run(with_policy(scen, n), trace=tr)
+            self.traces[n] = tr
         self._update_trace_plot()
-        self.play_btn.config(state="normal" if self.traces else "disabled")
+        xs, ys, y_full = self._economy_curve(scen)
+        series = {
+            "滑窗（丢弃超出部分）": list(zip(xs, ys)),
+            "直通（全保留）参考线": [(xs[0], y_full), (xs[-1], y_full)],
+        }
+        self.plot_econ.set_series(series, xlabel="历史保留上限（token；0 = 全部丢弃）", yname="每请求成本（¥）")
+        dt = (time.perf_counter() - t0) * 1000
+        self._set_status(f"已重算：{len(next(iter(self.traces.values())))} 轮 × 2 策略 + 经济曲线 {len(xs)} 点，"
+                         f"耗时 {dt:.0f} ms")
 
+    def _economy_curve(self, scen: Scenario):
+        span = (scen.workload.stable_prefix_tokens * 2
+                + 8 * (scen.workload.input_tokens_mean + scen.workload.output_tokens_mean))
+        xs = [span * i / (ECON_POINTS - 1) for i in range(ECON_POINTS)]
+        ys = []
+        for x in xs:
+            sc = dataclasses.replace(scen, policy=dataclasses.replace(scen.policy, window_max_tokens=x))
+            r = run_average(with_policy(sc, "sliding_window"), 1)
+            ys.append(r.cost_total / max(1, r.n_requests))
+        r = run_average(with_policy(scen, "passthrough"), 1)
+        return xs, ys, r.cost_total / max(1, r.n_requests)
+
+    # ---------- 时序图与回放 ----------
     def _update_trace_plot(self) -> None:
         if not self.traces:
-            self.plot_run.set_series({})
             return
         self._stop_play(reset=True)
         n = min(len(t) for t in self.traces.values())
@@ -600,7 +567,7 @@ class App(tk.Tk):
             if self.trace_smooth.get():
                 ys = _moving_avg(ys, max(1, n // 50))
             series[name] = list(zip(range(n), ys))
-        self.plot_run.set_series(series, xlabel="请求序号", yname=metric)
+        self.plot_run.set_series(series, xlabel="轮次（全部会话按时间混合）", yname=metric)
 
     def _toggle_play(self) -> None:
         if self._playing:
@@ -634,64 +601,6 @@ class App(tk.Tk):
             if hasattr(self, "plot_run"):
                 self.plot_run.set_reveal(None)
 
-    # ---------- 扫描页 ----------
-    def _build_sweep(self) -> None:
-        f = self.tab_sweep
-        top = ttk.Frame(f, padding=8)
-        top.pack(fill="x")
-        ttk.Label(top, text="场景 JSON:").pack(side="left")
-        self.sw_scenario = ttk.Entry(top)
-        self.sw_scenario.pack(side="left", fill="x", expand=True, padx=4)
-        ttk.Button(top, text="浏览…", command=lambda: self._pick_file(self.sw_scenario)).pack(side="left")
-        row2 = ttk.Frame(f, padding=(8, 4))
-        row2.pack(fill="x")
-        self.sw_param = tk.StringVar(value="mechanism.ttl")
-        ttk.Label(row2, text="参数:").pack(side="left")
-        ttk.Combobox(row2, textvariable=self.sw_param, values=SWEEP_PARAMS, width=26).pack(side="left", padx=(2, 10))
-        for label, attr, default, width in (
-            ("起", "sw_start", "0", 8),
-            ("止", "sw_stop", "3600", 8),
-            ("步数", "sw_steps", "6", 5),
-            ("种子", "sw_seeds", "2", 4),
-            ("策略", "sw_policies", ",".join(POLICIES), 30),
-        ):
-            ttk.Label(row2, text=label + ":").pack(side="left")
-            var = tk.StringVar(value=default)
-            ttk.Entry(row2, textvariable=var, width=width).pack(side="left", padx=(2, 10))
-            setattr(self, attr, var)
-        ttk.Button(row2, text="扫描并绘图", command=self.on_sweep).pack(side="left")
-        self.sw_tree = self._make_tree(f, ("value", "policy", "hit_ratio", "cost_total", "cost_per_req"))
-        self.plot_sweep = PlotWidget(f, height=220)
-        self.plot_sweep.pack(fill="both", expand=True, padx=8, pady=(0, 8))
-
-    def on_sweep(self) -> None:
-        try:
-            scen = load_scenario(self.sw_scenario.get().strip())
-            rows = run_sweep(
-                scen,
-                self.sw_param.get().strip(),
-                float(self.sw_start.get()),
-                float(self.sw_stop.get()),
-                int(self.sw_steps.get()),
-                [p.strip() for p in self.sw_policies.get().split(",")],
-                max(1, int(self.sw_seeds.get())),
-            )
-        except Exception as e:
-            messagebox.showerror("扫描失败", str(e))
-            return
-        tree = self.sw_tree
-        tree.delete(*tree.get_children())
-        for row in rows:
-            tree.insert("", "end", values=[
-                row["value"], row["policy"], row["hit_ratio"], row["cost_total"], row["cost_per_req"]])
-        series: dict[str, list[tuple[float, float]]] = {}
-        for row in rows:
-            if row["cost_per_req"] is not None:
-                series.setdefault(row["policy"], []).append((row["value"], row["cost_per_req"]))
-        self._last_param = self.sw_param.get().strip()
-        self.plot_sweep.set_series(series, xlabel=self._last_param, yname="每请求成本")
-        self._set_status(f"扫描完成：{len(rows)} 行")
-
     # ---------- 拟合页 ----------
     def _build_fit(self) -> None:
         f = self.tab_fit
@@ -700,10 +609,10 @@ class App(tk.Tk):
         ttk.Label(top, text="画像 JSON:").pack(side="left")
         self.fit_profile = ttk.Entry(top)
         self.fit_profile.pack(side="left", fill="x", expand=True, padx=4)
-        ttk.Button(top, text="浏览…", command=lambda: self._pick_file(self.fit_profile)).pack(side="left")
+        ttk.Button(top, text="浏览…", command=self._pick_profile).pack(side="left")
         row2 = ttk.Frame(f, padding=(8, 4))
         row2.pack(fill="x")
-        ttk.Label(row2, text="稳定前缀 tokens:").pack(side="left")
+        ttk.Label(row2, text="系统提示长度 tokens:").pack(side="left")
         self.fit_stable = tk.StringVar(value="")
         ttk.Entry(row2, textvariable=self.fit_stable, width=10).pack(side="left", padx=(2, 10))
         ttk.Button(row2, text="拟合预览", command=self.on_fit_preview).pack(side="left")
@@ -711,6 +620,12 @@ class App(tk.Tk):
         self.fit_text = tk.Text(f, height=24)
         self.fit_text.pack(fill="both", expand=True, padx=8, pady=8)
         self.fit_result: dict | None = None
+
+    def _pick_profile(self) -> None:
+        path = filedialog.askopenfilename(filetypes=[("JSON", "*.json")])
+        if path:
+            self.fit_profile.delete(0, "end")
+            self.fit_profile.insert(0, path)
 
     def on_fit_preview(self) -> None:
         try:
@@ -730,7 +645,7 @@ class App(tk.Tk):
         ] + [f"注意: {x}" for x in warnings] + ["", json.dumps(scenario, ensure_ascii=False, indent=1)]
         self.fit_text.delete("1.0", "end")
         self.fit_text.insert("1.0", "\n".join(lines))
-        self._set_status("拟合预览完成，可保存场景 JSON")
+        self._set_status("拟合预览完成，可保存场景 JSON（保存后在模拟页「从场景 JSON 载入」）")
 
     def on_fit_save(self) -> None:
         if self.fit_result is None:
@@ -743,6 +658,19 @@ class App(tk.Tk):
         with open(path, "w", encoding="utf-8") as f:
             json.dump(self.fit_result, f, ensure_ascii=False, indent=1)
         self._set_status(f"场景已保存: {path}")
+
+    # ---------- 假设页 ----------
+    def _build_assume(self) -> None:
+        f = self.tab_assume
+        txt = tk.Text(f, wrap="word", padx=16, pady=12, relief="flat", bg="#fbfbf7")
+        txt.pack(fill="both", expand=True)
+        txt.insert("1.0", ASSUMPTIONS_TEXT)
+        txt.configure(state="disabled")
+
+    # ---------- 状态栏 ----------
+    def _set_status(self, text: str) -> None:
+        self.status.set(text)
+        self.update_idletasks()
 
 
 def main() -> None:
