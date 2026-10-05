@@ -14,8 +14,9 @@ from __future__ import annotations
 import ctypes
 import dataclasses
 import json
+import queue
 import sys
-import time
+import threading
 import tkinter as tk
 from collections import deque
 from tkinter import filedialog, messagebox, ttk
@@ -39,6 +40,7 @@ METRICS = ("累计成本", "每请求成本", "命中率")
 SPEEDS = {"1x": 1, "2x": 2, "4x": 4, "8x": 8}
 ECON_POINTS = 14
 AUTO_MS = 280  # 参数变化后的防抖
+ROUND_LIMIT = 8000  # 单次重算的总轮数上限：超过则拒绝重算（防 UI 卡死），给出调整建议
 
 ASSUMPTIONS_TEXT = """建模自带假设（解读任何结论前先读）
 
@@ -284,6 +286,9 @@ class App(tk.Tk):
         self._playing = False
         self._play_i = 0
         self._pending = None
+        self._jobid = 0
+        self._queue: queue.Queue = queue.Queue()
+        self.after(80, self._poll)
         self.after(200, self._recompute)  # 打开即出默认折线
 
     # ---------- 参数面板（业务语言） ----------
@@ -391,6 +396,9 @@ class App(tk.Tk):
         ttk.Label(inner, text="自动重算：拖动停止约 0.3 秒后刷新两条折线。\n"
                               "经济曲线横轴 = 「历史保留上限」滑块的范围同一含义。",
                   wraplength=320, justify="left", foreground="#555", font=("", 8)).pack(anchor="w", pady=4)
+        self.est_label = ttk.Label(inner, text="", wraplength=320, justify="left",
+                                   foreground="#b45309", font=("", 9))
+        self.est_label.pack(anchor="w")
 
         def _bind_wheel(w):
             if isinstance(w, (ttk.Combobox, ttk.Spinbox, tk.Spinbox)):
@@ -503,35 +511,69 @@ class App(tk.Tk):
         self._set_status(f"已从 JSON 载入：{path}")
 
     def _schedule(self, *_):
+        est = self._estimate_rounds()
+        self.est_label.config(
+            text=f"预估轮数：{est:,}" + (f"（超上限 {ROUND_LIMIT}，请调小参数）" if est > ROUND_LIMIT else "，在可算范围内"))
         if self._pending is not None:
             self.after_cancel(self._pending)
         self._pending = self.after(AUTO_MS, self._recompute)
 
-    # ---------- 自动重算 ----------
+    def _estimate_rounds(self) -> int:
+        try:
+            return int(self.v_sessions.get() * self.v_hours.get() * 3600.0
+                       / max(1e-9, self.v_period.get() * 60.0))
+        except Exception:
+            return 0
+
+    # ---------- 自动重算（后台线程，UI 不冻结） ----------
     def _recompute(self) -> None:
         self._pending = None
-        self._stop_play(reset=True)
         try:
             scen = self._collect()
         except Exception as e:
             self._set_status(f"参数无效：{e}")
             return
-        t0 = time.perf_counter()
-        self.traces = {}
-        for n in ("passthrough", "sliding_window"):
-            tr: list = []
-            run(with_policy(scen, n), trace=tr)
-            self.traces[n] = tr
-        self._update_trace_plot()
-        xs, ys, y_full = self._economy_curve(scen)
-        series = {
-            "滑窗（丢弃超出部分）": list(zip(xs, ys)),
-            "直通（全保留）参考线": [(xs[0], y_full), (xs[-1], y_full)],
-        }
-        self.plot_econ.set_series(series, xlabel="历史保留上限（token；0 = 全部丢弃）", yname="每请求成本（¥）")
-        dt = (time.perf_counter() - t0) * 1000
-        self._set_status(f"已重算：{len(next(iter(self.traces.values())))} 轮 × 2 策略 + 经济曲线 {len(xs)} 点，"
-                         f"耗时 {dt:.0f} ms")
+        est = self._estimate_rounds()
+        if est > ROUND_LIMIT:
+            self._set_status(f"预估 {est:,} 轮，超上限 {ROUND_LIMIT}：请调小「模拟时长 / 群数量」，或调低 @ 频率")
+            return
+        self._jobid += 1
+        self._set_status(f"计算中：预估 {est:,} 轮 × 2 策略 + 经济曲线 …")
+        threading.Thread(target=self._worker, args=(self._jobid, scen), daemon=True).start()
+
+    def _worker(self, job: int, scen: Scenario) -> None:
+        try:
+            traces: dict[str, list] = {}
+            for n in ("passthrough", "sliding_window"):
+                tr: list = []
+                run(with_policy(scen, n), trace=tr)
+                traces[n] = tr
+            xs, ys, y_full = self._economy_curve(scen)
+            self._queue.put((job, traces, xs, ys, y_full))
+        except Exception as e:
+            self._queue.put((job, None, None, None, str(e)))
+
+    def _poll(self) -> None:
+        try:
+            while True:
+                job, traces, xs, ys, y_full = self._queue.get_nowait()
+                if job != self._jobid:
+                    continue  # 过期结果（参数又变了）直接丢弃
+                if traces is None:
+                    self._set_status(f"计算失败：{y_full}")
+                    continue
+                self._stop_play(reset=True)
+                self.traces = traces
+                self._update_trace_plot()
+                series = {
+                    "滑窗（丢弃超出部分）": list(zip(xs, ys)),
+                    "直通（全保留）参考线": [(xs[0], y_full), (xs[-1], y_full)],
+                }
+                self.plot_econ.set_series(series, xlabel="历史保留上限（token；0 = 全部丢弃）", yname="每请求成本（¥）")
+                self._set_status(f"已重算：{len(next(iter(traces.values()))):,} 轮 × 2 策略 + 经济曲线 {len(xs)} 点")
+        except queue.Empty:
+            pass
+        self.after(60, self._poll)
 
     def _economy_curve(self, scen: Scenario):
         span = (scen.workload.stable_prefix_tokens * 2
